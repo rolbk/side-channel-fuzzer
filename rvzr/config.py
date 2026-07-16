@@ -196,6 +196,9 @@ class Conf:
     """ call_weight_indirect_mono: relative weight of a monomorphic indirect call (fixed target) """
     call_weight_indirect_poly: float = 0.0
     """ call_weight_indirect_poly: relative weight of a polymorphic indirect call (via a pointer table) """
+    call_target_bias: float = 0.0
+    """ call_target_bias: bias toward earlier functions when picking a call target; forward callee j
+    gets weight (n_funcs - j) ** bias. 0 = uniform, 1 = linear ramp, higher = steeper """
     indirect_jmp_probability: float = 0.0
     """ indirect_jmp_probability: per-function probability of replacing the exit ret with a tail jmp reg """
     perturb_probability: float = 0.0

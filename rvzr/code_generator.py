@@ -596,7 +596,7 @@ class _FunctionGenerator:
                     continue
                 kind = self._pick_call_kind()
                 if kind == "direct":
-                    callee = funcs[random.randint(i + 1, n_funcs - 1)]
+                    callee = funcs[self._pick_forward_index(i, n_funcs)]
                     inst = self._instruction_generator.generate(self._isa_spec.get_call_spec())
                     label = inst.get_label_operand()
                     assert label is not None
@@ -618,6 +618,25 @@ class _FunctionGenerator:
         if sum(weights) <= 0:
             return "direct"
         return random.choices(["direct", "mono", "poly"], weights=weights)[0]
+
+    @staticmethod
+    def _pick_forward_index(i: int, n: int) -> int:
+        """ Pick a forward callee index in (i, n), biased toward earlier functions by
+        CONF.call_target_bias. bias <= 0 keeps the original uniform draw (RNG-identical). """
+        if CONF.call_target_bias <= 0.0:
+            return random.randint(i + 1, n - 1)
+        cand = list(range(i + 1, n))
+        weights = [(n - j) ** CONF.call_target_bias for j in cand]
+        return random.choices(cand, weights=weights)[0]
+
+    @staticmethod
+    def _pick_forward(forward: List[Function]) -> Function:
+        """ Like _pick_forward_index but over a forward slice of Function objects. """
+        if CONF.call_target_bias <= 0.0:
+            return random.choice(forward)
+        m = len(forward)
+        weights = [(m - k) ** CONF.call_target_bias for k in range(m)]
+        return random.choices(forward, weights=weights)[0]
 
     def wire_indirect_jmps(self, funcs: List[Function], appended: List[str]) -> None:
         """
@@ -649,7 +668,7 @@ class _FunctionGenerator:
 
         if not poly or len(forward) == 1:
             # `offset` is required: `mov reg, .function_j` would assemble as a load from the label
-            callee = random.choice(forward)
+            callee = self._pick_forward(forward)
             mov = Instruction("mov", is_instrumentation=True) \
                 .add_op(RegisterOp(reg32, 32, False, True)) \
                 .add_op(ImmediateOp("offset " + callee.name, 32))
@@ -662,7 +681,10 @@ class _FunctionGenerator:
             n <<= 1
         label = f".itable_{self._itable_counter}"
         self._itable_counter += 1
-        entries = ", ".join(forward[k % len(forward)].name for k in range(n))
+        if CONF.call_target_bias <= 0.0:
+            entries = ", ".join(forward[k % len(forward)].name for k in range(n))
+        else:
+            entries = ", ".join(self._pick_forward(forward).name for _ in range(n))
         appended.append(f"{label}: .quad {entries}")
 
         mask = Instruction("and", is_instrumentation=True) \

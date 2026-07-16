@@ -202,6 +202,9 @@ class Conf:
     """ perturb_probability: per-function probability of a branch-free return-stack perturbation """
     max_perturbations: int = 2
     """ max_perturbations: cap on return-stack perturbations per program """
+    collision_probability: float = 0.0
+    """ collision_probability: per-callee probability of emitting the function into a BTB-collision
+    section (.spec_coll1..4) instead of .spec_main """
     min_successors_per_bb: int = 2
     """ min_bb_per_function: min. number of successors for each basic block in generated programs
     Note 1: this config option is a *hint*; it could be ignored if the instruction set does not

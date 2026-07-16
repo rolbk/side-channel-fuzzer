@@ -85,7 +85,12 @@ class Printer(ABC):
     def _print_section(self, sec: CodeSection, file_: TextIO) -> None:
         file_.write(f".section .data.{sec.name}\n")
         for func in sec:
+            coll = getattr(func, "coll_section", None)
+            if coll:
+                file_.write(f".section {coll}\n")
             self._print_function(func, file_)
+            if coll:
+                file_.write(f".section .data.{sec.name}\n")
 
     def _print_function(self, func: Function, file_: TextIO) -> None:
         file_.write(f"{func.name}:\n")
@@ -193,6 +198,7 @@ class CodeGenerator(ABC):
         self._function_generator.wire_call_graph(funcs, test_case.appended_asm)  # type: ignore
         self._function_generator.wire_indirect_jmps(funcs, test_case.appended_asm)  # type: ignore
         self._function_generator.perturb_return_stack(funcs)
+        self._function_generator.assign_collision_sections(funcs)
 
         # add them to the test case, in the first section
         for func in funcs:
@@ -712,6 +718,20 @@ class _FunctionGenerator:
         return Instruction("add", is_instrumentation=True) \
             .add_op(RegisterOp("rsp", 64, True, True)) \
             .add_op(ImmediateOp("8", 8))
+
+    @staticmethod
+    def assign_collision_sections(funcs: List[Function]) -> None:
+        """
+        With probability CONF.collision_probability, place a callee (not the entry) into one of the
+        fixed-VA BTB-collision sections (.spec_coll1..4) instead of .spec_main, so its branches can
+        alias others in the BTB. Per-function, so the function's basic blocks stay contiguous.
+        """
+        if CONF.collision_probability <= 0.0:
+            return
+        coll = [".spec_coll1", ".spec_coll2", ".spec_coll3", ".spec_coll4"]
+        for func in funcs[1:]:
+            if random.random() < CONF.collision_probability:
+                func.coll_section = random.choice(coll)  # type: ignore[attr-defined]
 
 
 class _InstructionGenerator:

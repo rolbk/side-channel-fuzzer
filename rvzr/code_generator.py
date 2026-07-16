@@ -78,6 +78,10 @@ class Printer(ABC):
             for line in self.epilogue_template:
                 f.write(line)
 
+            # trailing raw asm (indirect-call jump tables), emitted after the code
+            for line in getattr(test_case, "appended_asm", None) or []:
+                f.write(line if line.endswith("\n") else line + "\n")
+
     def _print_section(self, sec: CodeSection, file_: TextIO) -> None:
         file_.write(f".section .data.{sec.name}\n")
         for func in sec:
@@ -182,8 +186,12 @@ class CodeGenerator(ABC):
         for func in funcs:
             self._function_generator.fill_function(func)
 
+        # raw asm appended after the epilogue (indirect-call jump tables)
+        test_case.appended_asm = []  # type: ignore[attr-defined]
+
         # wire a forward-only call graph; no-op when n_funcs == 1
-        self._function_generator.wire_call_graph(funcs)
+        self._function_generator.wire_call_graph(funcs, test_case.appended_asm)  # type: ignore
+        self._function_generator.wire_indirect_jmps(funcs, test_case.appended_asm)  # type: ignore
         self._function_generator.perturb_return_stack(funcs)
 
         # add them to the test case, in the first section
@@ -423,9 +431,14 @@ class _FunctionGenerator:
     _instruction_generator: _InstructionGenerator
     _isa_spec: InstructionSet
 
+    # GPRs usable as an indirect-branch target (64-bit name -> 32-bit name)
+    _TARGET_REGS = {"rax": "eax", "rbx": "ebx", "rcx": "ecx",
+                    "rdx": "edx", "rsi": "esi", "rdi": "edi"}
+
     def __init__(self, target_desc: TargetDesc, isa_spec: InstructionSet) -> None:
         self._instruction_generator = _InstructionGenerator(target_desc)
         self._isa_spec = isa_spec
+        self._itable_counter = 0  # unique labels for indirect-call jump tables
 
     def generate_empty(self, label: str, parent: CodeSection, is_entry: bool = True) -> Function:
         """ Generates an empty function with a random DAG of basic blocks.
@@ -562,24 +575,98 @@ class _FunctionGenerator:
             if len(bb) == 0:
                 bb.insert_after(None, Instruction("nop"))
 
-    def wire_call_graph(self, funcs: List[Function]) -> None:
+    def wire_call_graph(self, funcs: List[Function], appended: List[str]) -> None:
         """
-        Insert direct calls between functions, forming a forward-only (acyclic) call graph: function
-        i may call only function j > i, so there is no recursion and the depth is bounded. The call
-        goes in as the first terminator of a block -- the parser wants control flow at the end of a
-        block, and the last terminator must stay the unconditional branch.
+        Insert calls (direct or register-indirect) between functions, forming a forward-only
+        (acyclic) call graph: function i may call only function j > i, so there is no recursion and
+        the depth is bounded. The call goes in as the first terminator of a block -- the parser wants
+        control flow at the end of a block, and the last terminator must stay the unconditional
+        branch. The call kind is a weighted choice (CONF.call_weight_*).
         """
         n_funcs = len(funcs)
         for i in range(n_funcs - 1):  # the last function has no forward target
             for bb in funcs[i]:
                 if random.random() >= CONF.call_probability:
                     continue
-                callee = funcs[random.randint(i + 1, n_funcs - 1)]
-                inst = self._instruction_generator.generate(self._isa_spec.get_call_spec())
-                label = inst.get_label_operand()
-                assert label is not None
-                label.value = callee.name
-                bb.terminators.insert(0, inst)
+                kind = self._pick_call_kind()
+                if kind == "direct":
+                    callee = funcs[random.randint(i + 1, n_funcs - 1)]
+                    inst = self._instruction_generator.generate(self._isa_spec.get_call_spec())
+                    label = inst.get_label_operand()
+                    assert label is not None
+                    label.value = callee.name
+                    bb.terminators.insert(0, inst)
+                else:
+                    # indirect call: materialize a forward target into a register, then call it
+                    reg = self._materialize_forward_target(i, funcs, bb, appended,
+                                                           poly=(kind == "poly"))
+                    call = Instruction("call", category="BASE-CALL", is_control_flow=True) \
+                        .add_op(RegisterOp(reg, 64, True, False))
+                    bb.terminators.insert(0, call)
+
+    @staticmethod
+    def _pick_call_kind() -> str:
+        """ Weighted choice of call kind: 'direct' | 'mono' | 'poly' (see CONF.call_weight_*) """
+        weights = [CONF.call_weight_direct, CONF.call_weight_indirect_mono,
+                   CONF.call_weight_indirect_poly]
+        if sum(weights) <= 0:
+            return "direct"
+        return random.choices(["direct", "mono", "poly"], weights=weights)[0]
+
+    def wire_indirect_jmps(self, funcs: List[Function], appended: List[str]) -> None:
+        """
+        Optionally replace a callee's exit `ret` with a tail `jmp reg` to a forward function. The
+        target returns for us (a tail call); forward-only targets keep it acyclic and terminating.
+        The entry is left alone so its `jmp .test_case_exit` bounds the measurement window.
+        """
+        for i in range(1, len(funcs) - 1):
+            if random.random() >= CONF.indirect_jmp_probability:
+                continue
+            exit_bb = funcs[i].get_exit_bb()
+            reg = self._materialize_forward_target(i, funcs, exit_bb, appended,
+                                                   poly=random.random() < 0.5)
+            jmp = Instruction("jmp", category="BASE-UNCOND_BR", is_control_flow=True) \
+                .add_op(RegisterOp(reg, 64, True, False))
+            exit_bb.terminators = [jmp]
+
+    def _materialize_forward_target(self, i: int, funcs: List[Function],
+                                    bb: BasicBlock, appended: List[str], poly: bool) -> str:
+        """
+        Leave a forward function entry (index > i) in a GPR and return its 64-bit name. Two modes:
+          A (mono): `mov reg, offset .function_j`  -- fixed target.
+          B (poly): `and reg, N-1; mov reg, [table + reg*8]`  -- data-dependent target via a table.
+        The gadget is is_instrumentation so the sandbox pass leaves mode B's table read alone.
+        """
+        reg = random.choice(list(self._TARGET_REGS))
+        reg32 = self._TARGET_REGS[reg]
+        forward = funcs[i + 1:]
+
+        if not poly or len(forward) == 1:
+            # `offset` is required: `mov reg, .function_j` would assemble as a load from the label
+            callee = random.choice(forward)
+            mov = Instruction("mov", is_instrumentation=True) \
+                .add_op(RegisterOp(reg32, 32, False, True)) \
+                .add_op(ImmediateOp("offset " + callee.name, 32))
+            bb.insert_after(bb.get_last(), mov)
+            return reg
+
+        # Mode B: power-of-two pointer table
+        n = 1
+        while n < len(forward):
+            n <<= 1
+        label = f".itable_{self._itable_counter}"
+        self._itable_counter += 1
+        entries = ", ".join(forward[k % len(forward)].name for k in range(n))
+        appended.append(f"{label}: .quad {entries}")
+
+        mask = Instruction("and", is_instrumentation=True) \
+            .add_op(RegisterOp(reg32, 32, True, True)).add_op(ImmediateOp(str(n - 1), 32))
+        load = Instruction("mov", is_instrumentation=True) \
+            .add_op(RegisterOp(reg, 64, False, True)) \
+            .add_op(MemoryOp(f"{label} + {reg}*8", 64, True, False))
+        bb.insert_after(bb.get_last(), mask)
+        bb.insert_after(bb.find_instruction_node(mask), load)
+        return reg
 
     def perturb_return_stack(self, funcs: List[Function]) -> None:
         """

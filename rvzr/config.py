@@ -190,6 +190,14 @@ class Conf:
     Function 0 is the entry, the rest are callees reached by (forward-only) calls. Default 1 = no calls """
     call_probability: float = 0.0
     """ call_probability: per-basic-block probability of emitting a call to a later function """
+    call_weight_direct: float = 1.0
+    """ call_weight_direct: relative weight of a direct call when a call is emitted """
+    call_weight_indirect_mono: float = 0.0
+    """ call_weight_indirect_mono: relative weight of a monomorphic indirect call (fixed target) """
+    call_weight_indirect_poly: float = 0.0
+    """ call_weight_indirect_poly: relative weight of a polymorphic indirect call (via a pointer table) """
+    indirect_jmp_probability: float = 0.0
+    """ indirect_jmp_probability: per-function probability of replacing the exit ret with a tail jmp reg """
     perturb_probability: float = 0.0
     """ perturb_probability: per-function probability of a branch-free return-stack perturbation """
     max_perturbations: int = 2

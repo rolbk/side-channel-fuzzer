@@ -184,6 +184,7 @@ class CodeGenerator(ABC):
 
         # wire a forward-only call graph; no-op when n_funcs == 1
         self._function_generator.wire_call_graph(funcs)
+        self._function_generator.perturb_return_stack(funcs)
 
         # add them to the test case, in the first section
         for func in funcs:
@@ -579,6 +580,51 @@ class _FunctionGenerator:
                 assert label is not None
                 label.value = callee.name
                 bb.terminators.insert(0, inst)
+
+    def perturb_return_stack(self, funcs: List[Function]) -> None:
+        """
+        Sparsely inject branch-free return-stack perturbations. No runtime guards are used -- a guard
+        would add a branch and train the predictors we want to watch; termination is guaranteed by
+        the static call graph instead. All injected instructions are is_instrumentation. Gated by
+        CONF.perturb_probability, capped at CONF.max_perturbations. Mechanisms:
+          * pop-skip      -- `add rsp, 8` before a callee `ret`: returns one frame further out.
+          * abandon-frame -- callee exits via `jmp .test_case_exit` instead of `ret`.
+          * rsb-desync    -- `call .+0 ; add rsp, 8`: pushes the RSB but is an rsp no-op.
+        """
+        if CONF.perturb_probability <= 0.0:
+            return
+        applied = 0
+        for i, func in enumerate(funcs):
+            if applied >= CONF.max_perturbations:
+                break
+            if random.random() >= CONF.perturb_probability:
+                continue
+            is_callee = (i != 0)  # func 0 is the entry, holds no return address
+            mech = random.choice(
+                ["pop_skip", "abandon_frame", "rsb_desync"] if is_callee else ["rsb_desync"])
+            if mech == "pop_skip":
+                exit_bb = func.get_exit_bb()
+                exit_bb.insert_after(exit_bb.get_last(), self._add_rsp8())
+            elif mech == "abandon_frame":
+                jmp = self._instruction_generator.generate(
+                    self._isa_spec.get_unconditional_jump_spec())
+                label = jmp.get_label_operand()
+                assert label is not None
+                label.value = TC_EXIT_LABEL
+                func.get_exit_bb().terminators = [jmp]
+            else:  # rsb_desync
+                bb = random.choice(list(func))
+                call0 = Instruction(".byte 0xe8, 0x00, 0x00, 0x00, 0x00", is_instrumentation=True)
+                bb.insert_after(bb.get_last(), call0)     # call .+0
+                bb.insert_after(bb.find_instruction_node(call0), self._add_rsp8())
+            applied += 1
+
+    @staticmethod
+    def _add_rsp8() -> Instruction:
+        """ `add rsp, 8` (instrumentation, so the sandbox pass leaves rsp alone) """
+        return Instruction("add", is_instrumentation=True) \
+            .add_op(RegisterOp("rsp", 64, True, True)) \
+            .add_op(ImmediateOp("8", 8))
 
 
 class _InstructionGenerator:

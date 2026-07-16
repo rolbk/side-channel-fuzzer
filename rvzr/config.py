@@ -190,6 +190,10 @@ class Conf:
     Function 0 is the entry, the rest are callees reached by (forward-only) calls. Default 1 = no calls """
     call_probability: float = 0.0
     """ call_probability: per-basic-block probability of emitting a call to a later function """
+    perturb_probability: float = 0.0
+    """ perturb_probability: per-function probability of a branch-free return-stack perturbation """
+    max_perturbations: int = 2
+    """ max_perturbations: cap on return-stack perturbations per program """
     min_successors_per_bb: int = 2
     """ min_bb_per_function: min. number of successors for each basic block in generated programs
     Note 1: this config option is a *hint*; it could be ignored if the instruction set does not

@@ -67,6 +67,18 @@ class InstructionSet:
             return InstructionSpec("ret", "general-ret", is_control_flow=True)
         raise NotImplementedError(f"Unsupported instruction set: {CONF.instruction_set}")
 
+    def get_call_spec(self) -> InstructionSpec:
+        """ Return the instruction spec for the direct CALL instruction on the given architecture """
+        if CONF.instruction_set == "x86-64":
+            spec = InstructionSpec("call", "BASE-CALL", is_control_flow=True)
+            spec.operands.append(OperandSpec([], OT.LABEL, src=True, dest=False, width=64))
+            return spec
+        if CONF.instruction_set == "arm64":
+            spec = InstructionSpec("bl", "general-call", is_control_flow=True)
+            spec.operands.append(OperandSpec([], OT.LABEL, src=True, dest=False, width=64))
+            return spec
+        raise NotImplementedError(f"Unsupported instruction set: {CONF.instruction_set}")
+
     def get_unconditional_jump_spec(self) -> InstructionSpec:
         """
         Return the instruction spec for the unconditional jump instruction

@@ -170,15 +170,24 @@ class CodeGenerator(ABC):
             error("Generation of test cases with multiple actors is not yet supported")
         self.generate_actors_with_sections(test_case, actors_config)
 
-        # create empty main function and fill it with random instructions
+        # create the functions and fill them with random instructions (function 0 is the entry)
         main_section = test_case[0]
         default_actor = main_section.owner
         assert default_actor.is_main
-        main_func = self._function_generator.generate_empty(".function_0", main_section)
-        self._function_generator.fill_function(main_func)
+        n_funcs = random.randint(1, CONF.max_functions)
+        funcs = [
+            self._function_generator.generate_empty(
+                f".function_{i}", main_section, is_entry=(i == 0)) for i in range(n_funcs)
+        ]
+        for func in funcs:
+            self._function_generator.fill_function(func)
 
-        # add it to the test case, in the first section
-        test_case[0].append(main_func)
+        # wire a forward-only call graph; no-op when n_funcs == 1
+        self._function_generator.wire_call_graph(funcs)
+
+        # add them to the test case, in the first section
+        for func in funcs:
+            test_case[0].append(func)
 
         # process the test case
         for p in self._passes:
@@ -417,8 +426,9 @@ class _FunctionGenerator:
         self._instruction_generator = _InstructionGenerator(target_desc)
         self._isa_spec = isa_spec
 
-    def generate_empty(self, label: str, parent: CodeSection) -> Function:
-        """ Generates an empty function with a random DAG of basic blocks """
+    def generate_empty(self, label: str, parent: CodeSection, is_entry: bool = True) -> Function:
+        """ Generates an empty function with a random DAG of basic blocks.
+        is_entry: entry ends with a jump to the exit; a callee ends with a return. """
         func = Function(label, parent)
 
         # Define the maximum allowed number of successors for any BB
@@ -464,11 +474,13 @@ class _FunctionGenerator:
                 options.remove(target)
                 current_bb.successors.append(target)
 
-        # Function returns are not yet supported
-        # hence all functions end with an unconditional jump to the exit
-        inst = self._instruction_generator.generate(self._isa_spec.get_unconditional_jump_spec())
-        assert isinstance(inst.operands[0], LabelOp)
-        inst.operands[0].value = TC_EXIT_LABEL
+        # entry ends with a jump to the exit; a callee returns to its caller
+        if is_entry:
+            inst = self._instruction_generator.generate(self._isa_spec.get_unconditional_jump_spec())
+            assert isinstance(inst.operands[0], LabelOp)
+            inst.operands[0].value = TC_EXIT_LABEL
+        else:
+            inst = self._instruction_generator.generate(self._isa_spec.get_return_spec())
         func.get_exit_bb().terminators = [inst]
 
         # Finalize the function
@@ -543,6 +555,30 @@ class _FunctionGenerator:
                 self._isa_spec.non_memory_access_specs, self._isa_spec.store_instructions,
                 self._isa_spec.load_instruction, CONF.avg_mem_accesses / CONF.program_size)
             bb.insert_after(bb.get_last(), inst)
+
+        # an empty BB breaks X86PatchUndefinedFlagsPass (no node to anchor the patch on); add a nop
+        for bb in bb_list:
+            if len(bb) == 0:
+                bb.insert_after(None, Instruction("nop"))
+
+    def wire_call_graph(self, funcs: List[Function]) -> None:
+        """
+        Insert direct calls between functions, forming a forward-only (acyclic) call graph: function
+        i may call only function j > i, so there is no recursion and the depth is bounded. The call
+        goes in as the first terminator of a block -- the parser wants control flow at the end of a
+        block, and the last terminator must stay the unconditional branch.
+        """
+        n_funcs = len(funcs)
+        for i in range(n_funcs - 1):  # the last function has no forward target
+            for bb in funcs[i]:
+                if random.random() >= CONF.call_probability:
+                    continue
+                callee = funcs[random.randint(i + 1, n_funcs - 1)]
+                inst = self._instruction_generator.generate(self._isa_spec.get_call_spec())
+                label = inst.get_label_operand()
+                assert label is not None
+                label.value = callee.name
+                bb.terminators.insert(0, inst)
 
 
 class _InstructionGenerator:

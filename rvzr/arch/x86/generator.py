@@ -894,6 +894,37 @@ class _X86PatchUndefinedResultPass(Pass):
         parent.insert_before(node, apply_mask)
 
 
+class _X86PatchNondetOutputPass(Pass):
+    """
+    Wipe the output registers of instructions whose result is not reproducible across engines, so the
+    value cannot reach data-dependent control flow. CPUID (vendor/leaf-specific) and rdtsc/rdtscp/rdpmc
+    (counters) return different values under QEMU-TCG -- used by the DSM QEMU-fold -- than on real Zen1,
+    which would make the two take different paths and desync the fold from the hardware retire stream.
+    The instructions are kept (cpuid's serializing effect is worth fuzzing); only their outputs are
+    overwritten with a constant. All write GPRs only and touch no flags.
+    """
+
+    # instruction -> the fixed output registers it clobbers (64-bit names), in emit order
+    _NONDET_OUT = {
+        "cpuid":  ("rax", "rbx", "rcx", "rdx"),
+        "rdtsc":  ("rax", "rdx"),
+        "rdtscp": ("rax", "rcx", "rdx"),
+        "rdpmc":  ("rax", "rdx"),
+    }
+
+    def run_on_test_case(self, test_case: TestCaseProgram) -> None:
+        for bb in test_case.iter_basic_blocks():
+            targets = [n for n in bb.iter_nodes()
+                       if not n.instruction.is_instrumentation and n.instruction.name in self._NONDET_OUT]
+            for node in targets:
+                # insert in REVERSE so the emitted order stays: <insn>; mov rax,0; mov rbx,0; ...
+                for reg in reversed(self._NONDET_OUT[node.instruction.name]):
+                    wipe = Instruction("mov", is_instrumentation=True) \
+                        .add_op(RegisterOp(reg, 64, False, True)) \
+                        .add_op(ImmediateOp("0", 32))
+                    bb.insert_after(node, wipe)
+
+
 class _X86PatchOpcodesPass(Pass):
     """
     Replaces assembly instructions with their opcodes.
@@ -973,6 +1004,7 @@ class X86Generator(CodeGenerator):
 
         # configure instrumentation passes
         self._passes = [
+            _X86PatchNondetOutputPass(),   # wipe cpuid/rd* non-reproducible output regs (QEMU-fold determinism)
             _X86PatchUndefinedFlagsPass(self._instruction_set, self),
             _X86SandboxPass(self._target_desc, self._faults),
             _X86PatchUndefinedResultPass(),

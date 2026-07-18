@@ -191,6 +191,10 @@ class CodeGenerator(ABC):
         for func in funcs:
             self._function_generator.fill_function(func)
 
+        # seed rax with the training-loop counter (r13) at entry, so runs vary per iteration
+        if CONF.seed_rax_loop_var:
+            self._function_generator.seed_loop_var(funcs[0])
+
         # raw asm appended after the epilogue (indirect-call jump tables)
         test_case.appended_asm = []  # type: ignore[attr-defined]
 
@@ -740,6 +744,16 @@ class _FunctionGenerator:
         return Instruction("add", is_instrumentation=True) \
             .add_op(RegisterOp("rsp", 64, True, True)) \
             .add_op(ImmediateOp("8", 8))
+
+    @staticmethod
+    def seed_loop_var(entry: Function) -> None:
+        """ Prepend `mov rax, r13` to the entry: rax starts each run at the harness training-loop
+        counter (r13), so repeated runs of the program differ. r13 is set by the harness and
+        blocklisted from the operand pool, so nothing else reads it. """
+        seed = Instruction("mov", is_instrumentation=True) \
+            .add_op(RegisterOp("rax", 64, False, True)) \
+            .add_op(RegisterOp("r13", 64, True, False))
+        next(iter(entry)).insert_before(None, seed)
 
     @staticmethod
     def assign_collision_sections(funcs: List[Function]) -> None:

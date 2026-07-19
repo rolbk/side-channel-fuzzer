@@ -718,9 +718,13 @@ class _FunctionGenerator:
                 break
             if random.random() >= CONF.perturb_probability:
                 continue
-            is_callee = (i != 0)  # func 0 is the entry, holds no return address
+            # pop-skip and abandon-frame edit the exit terminator, so they are only safe on a plain
+            # `ret`; a callee whose ret was already turned into a tail `jmp reg` (wire_indirect_jmps),
+            # or the entry (jmp to exit), gets only rsb-desync -- body-local and self-balancing.
+            term = func.get_exit_bb().terminators
+            plain_ret = i != 0 and len(term) == 1 and term[0].name == "ret"
             mech = random.choice(
-                ["pop_skip", "abandon_frame", "rsb_desync"] if is_callee else ["rsb_desync"])
+                ["pop_skip", "abandon_frame", "rsb_desync"] if plain_ret else ["rsb_desync"])
             if mech == "pop_skip":
                 exit_bb = func.get_exit_bb()
                 exit_bb.insert_after(exit_bb.get_last(), self._add_rsp8())

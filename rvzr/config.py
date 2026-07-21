@@ -211,6 +211,10 @@ class Conf:
     seed_rax_loop_var: bool = False
     """ seed_rax_loop_var: prepend `mov rax, r13` to the entry, seeding rax with the harness
     training-loop counter so repeated runs of the program differ. Off by default (r13 is reserved) """
+    return_variant_probability: float = 0.0
+    """ return_variant_probability: per-callee probability of returning via `ret imm` / far `retf` /
+    `iretq` instead of a near `ret`. The callee's prologue rebuilds its return frame in place so it
+    stays stack-equivalent to a plain ret. Default 0.0 """
     min_successors_per_bb: int = 2
     """ min_bb_per_function: min. number of successors for each basic block in generated programs
     Note 1: this config option is a *hint*; it could be ignored if the instruction set does not

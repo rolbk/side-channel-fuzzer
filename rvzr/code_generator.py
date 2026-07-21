@@ -200,6 +200,7 @@ class CodeGenerator(ABC):
 
         # wire a forward-only call graph; no-op when n_funcs == 1
         self._function_generator.wire_call_graph(funcs, test_case.appended_asm)  # type: ignore
+        self._function_generator.assign_return_variants(funcs)
         self._function_generator.wire_indirect_jmps(funcs, test_case.appended_asm)  # type: ignore
         self._function_generator.perturb_return_stack(funcs)
         self._function_generator.assign_collision_sections(funcs)
@@ -651,6 +652,8 @@ class _FunctionGenerator:
         for i in range(1, len(funcs) - 1):
             if random.random() >= CONF.indirect_jmp_probability:
                 continue
+            if getattr(funcs[i], "return_variant", None):   # its exit already rebuilds the return frame
+                continue
             exit_bb = funcs[i].get_exit_bb()
             reg = self._materialize_forward_target(i, funcs, exit_bb, appended,
                                                    poly=random.random() < 0.5)
@@ -718,6 +721,8 @@ class _FunctionGenerator:
                 break
             if random.random() >= CONF.perturb_probability:
                 continue
+            if getattr(func, "return_variant", None):   # its return frame is already special
+                continue
             # pop-skip and abandon-frame edit the exit terminator, so they are only safe on a plain
             # `ret`; a callee whose ret was already turned into a tail `jmp reg` (wire_indirect_jmps),
             # or the entry (jmp to exit), gets only rsb-desync -- body-local and self-balancing.
@@ -772,6 +777,73 @@ class _FunctionGenerator:
         for func in funcs[1:]:
             if random.random() < CONF.collision_probability:
                 func.coll_section = random.choice(coll)  # type: ignore[attr-defined]
+
+    def assign_return_variants(self, funcs: List[Function]) -> None:
+        """
+        With probability CONF.return_variant_probability, return a callee via `ret imm` / far `retf` /
+        `iretq` instead of a near `ret`. Each pops more than the near `call` pushed (retf also pops CS,
+        iretq also RFLAGS/RSP/SS), so the callee rebuilds its own return frame right before returning --
+        is_instrumentation writes to the dedicated return stack, using the CURRENT cs/ss/rflags so
+        nothing changes on return. The result is stack-equivalent to a plain ret, with no call-site
+        coordination. It runs in the EXIT block (not the prologue): the extra frame data is on the stack
+        for zero other instructions, so a pop-skip in a deeper callee can't `add rsp` into it. A tagged
+        callee is left out of the tail-jmp and perturbation passes.
+        """
+        if CONF.return_variant_probability <= 0.0:
+            return
+        for func in funcs[1:]:                       # callees only; the entry keeps jmp .test_case_exit
+            if random.random() >= CONF.return_variant_probability:
+                continue
+            variant = random.choice(["ret_imm", "retf", "iretq"])
+            setup, term = self._return_variant_gadget(variant)
+            exit_bb = func.get_exit_bb()
+            for inst in setup:                       # append after the body, right before the return
+                exit_bb.insert_after(exit_bb.get_last(), inst)
+            exit_bb.terminators = [term]
+            func.return_variant = variant            # type: ignore[attr-defined]
+
+    @staticmethod
+    def _return_variant_gadget(variant: str) -> Tuple[List[Instruction], Instruction]:
+        """ Return (prologue, terminator) for a return variant. The prologue turns the near-return
+        frame at [rsp] into the frame the terminator pops; all of it is is_instrumentation. """
+        def mov_rm(reg, mem):
+            return Instruction("mov", is_instrumentation=True) \
+                .add_op(RegisterOp(reg, 64, False, True)).add_op(MemoryOp(mem, 64, True, False))
+        def mov_mr(mem, reg):
+            return Instruction("mov", is_instrumentation=True) \
+                .add_op(MemoryOp(mem, 64, False, True)).add_op(RegisterOp(reg, 64, True, False))
+        def mov_rr(dst, dw, src, sw):
+            return Instruction("mov", is_instrumentation=True) \
+                .add_op(RegisterOp(dst, dw, False, True)).add_op(RegisterOp(src, sw, True, False))
+        def alu(op, reg, imm, w=64):
+            return Instruction(op, is_instrumentation=True) \
+                .add_op(RegisterOp(reg, w, True, True)).add_op(ImmediateOp(str(imm), 32))
+        def bare(name, cf=False):
+            return Instruction(name, is_instrumentation=not cf, is_control_flow=cf)
+
+        if variant == "ret_imm":
+            # near return that also adds N to rsp; copy RIP down by N so it stays balanced.
+            n = 16
+            prologue = [mov_rm("rax", "rsp"), alu("sub", "rsp", n), mov_mr("rsp", "rax")]
+            term = Instruction("ret", "BASE-RET", is_control_flow=True).add_op(ImmediateOp(str(n), 16))
+            return prologue, term
+        if variant == "retf":
+            # far return pops RIP+CS (16 bytes); make room and lay [RIP, CS] below the caller's frame.
+            prologue = [mov_rm("rax", "rsp"), mov_rr("rcx", 64, "cs", 16),
+                        alu("sub", "rsp", 8), mov_mr("rsp", "rax"), mov_mr("rsp + 8", "rcx")]
+            return prologue, bare(".byte 0x48, 0xcb", cf=True)   # retfq
+        # iretq: pops RIP,CS,RFLAGS,RSP,SS (40 bytes). Use current cs/ss/rflags and RSP = post-return.
+        prologue = [
+            mov_rm("rax", "rsp"),                    # RIP
+            mov_rr("rdi", 64, "rsp", 64), alu("add", "rdi", 8),   # rdi = post-return rsp
+            bare("pushfq"), Instruction("pop", is_instrumentation=True).add_op(RegisterOp("rdx", 64, False, True)),
+            alu("and", "edx", 0xFFFFBFFF, w=32),     # clear NT so iretq is a normal return (edx zero-extends rdx)
+            mov_rr("rcx", 64, "cs", 16), mov_rr("rsi", 64, "ss", 16),
+            alu("sub", "rsp", 40),
+            mov_mr("rsp", "rax"), mov_mr("rsp + 8", "rcx"), mov_mr("rsp + 16", "rdx"),
+            mov_mr("rsp + 24", "rdi"), mov_mr("rsp + 32", "rsi"),
+        ]
+        return prologue, bare(".byte 0x48, 0xcf", cf=True)       # iretq
 
 
 class _InstructionGenerator:
